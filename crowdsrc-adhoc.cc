@@ -16,6 +16,13 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
  * Author: Mathieu Lacage <mathieu.lacage@sophia.inria.fr>
+ * 
+ * NOTE FOR DISSERTATION PROJECT BY MARK TYLER
+ * ---
+ * I have left a few things in the script, commented out, to reflect some of
+ * the approaches that I took in the development of the script but ultimately
+ * had to leave out. These may or may not have been mentioned in the dissertation
+ * text.
  */
 
 #include "ns3/gnuplot.h"
@@ -27,17 +34,18 @@
 #include "ns3/log.h"
 #include "ns3/yans-wifi-helper.h"
 #include "ns3/mobility-helper.h"
-#include "ns3/ipv4-address-helper.h"
+#include "ns3/ipv6-address-helper.h"
 #include "ns3/on-off-helper.h"
 #include "ns3/yans-wifi-channel.h"
 #include "ns3/mobility-model.h"
 #include "ns3/packet-socket-helper.h"
 #include "ns3/packet-socket-address.h"
 #include "ns3/netanim-module.h"
-#include "ns3/olsr-helper.h"
-#include "ns3/ipv4-static-routing-helper.h"
-#include "ns3/ipv4-list-routing-helper.h"
+#include "ns3/ripng-helper.h"
+#include "ns3/ipv6-static-routing-helper.h"
+#include "ns3/ipv6-list-routing-helper.h"
 #include "ns3/internet-stack-helper.h"
+#include "ns3/flow-monitor-helper.h"
 
 using namespace ns3;
 
@@ -52,9 +60,6 @@ public:
                         const WifiMacHelper &wifiMac, const YansWifiChannelHelper &wifiChannel);
 private:
   void ReceivePacket (Ptr<Socket> socket);
-  void SetPosition (Ptr<Node> node, Vector position);
-  Vector GetPosition (Ptr<Node> node);
-  void AdvancePosition (Ptr<Node> node);
   Ptr<Socket> SetupPacketReceive (Ptr<Node> node);
 
   uint32_t m_bytesTotal;
@@ -71,47 +76,32 @@ Experiment::Experiment (std::string name)
   m_output.SetStyle (Gnuplot2dDataset::LINES);
 }
 
-void
-Experiment::SetPosition (Ptr<Node> node, Vector position)
-{
-  Ptr<MobilityModel> mobility = node->GetObject<MobilityModel> ();
-  mobility->SetPosition (position);
-}
+static void
+CourseChange (std::string context, Ptr<const MobilityModel> mobility)
+ {
+   Vector pos = mobility->GetPosition ();
+   Vector vel = mobility->GetVelocity ();
+   std::cout << Simulator::Now () << ", model=" << mobility << ", POS: x=" << pos.x << ", y=" << pos.y
+             << ", z=" << pos.z << "; VEL:" << vel.x << ", y=" << vel.y
+             << ", z=" << vel.z << std::endl;
+ }
 
-Vector
-Experiment::GetPosition (Ptr<Node> node)
-{
-  Ptr<MobilityModel> mobility = node->GetObject<MobilityModel> ();
-  return mobility->GetPosition ();
-}
-
-void
-Experiment::AdvancePosition (Ptr<Node> node)
-{
-  Vector pos = GetPosition (node);
-  double mbs = ((m_bytesTotal * 8.0) / 1000000);
-  m_bytesTotal = 0;
-  m_output.Add (pos.x, mbs);
-  pos.x += 1.0;
-  if (pos.x >= 210.0)
-    {
-      return;
-    }
-  /*pos.y += 1.0;
-  if (pos.y >= 210.0)
-    {
-      return;
-    }*/
-  SetPosition (node, pos);
-  Simulator::Schedule (Seconds (1.0), &Experiment::AdvancePosition, this, node);
-}
-
+/* 
+* In this method, I had plans to add more functionality with
+* regards to forwarding packets between nodes and simulating
+* the sharing of data and not just plain packets.
+*/
 void
 Experiment::ReceivePacket (Ptr<Socket> socket)
 {
   Ptr<Packet> packet;
   while ((packet = socket->Recv ()))
     {
+      SocketIpv6HopLimitTag hoplimitTag;
+      if (packet->RemovePacketTag (hoplimitTag))
+        {
+          NS_LOG_INFO (" HOPLIMIT = " << (uint32_t)hoplimitTag.GetHopLimit ());
+        }
       m_bytesTotal += packet->GetSize ();
     }
 }
@@ -121,51 +111,33 @@ Experiment::SetupPacketReceive (Ptr<Node> node)
 {
   TypeId tid = TypeId::LookupByName ("ns3::PacketSocketFactory");
   Ptr<Socket> sink = Socket::CreateSocket (node, tid);
+  NS_LOG_UNCOND ("socket created");
+  uint32_t ipv6Hoplimit = 0;
+  bool ipv6RecvHoplimit = true;
+  sink->SetIpv6RecvHopLimit (ipv6RecvHoplimit);
   sink->Bind ();
+  if (ipv6Hoplimit > 3)
+    {
+      sink->SetIpv6HopLimit (ipv6Hoplimit);
+    }
   sink->SetRecvCallback (MakeCallback (&Experiment::ReceivePacket, this));
+  NS_LOG_UNCOND ("sink made");
   return sink;
-}
-
-void 
-Experiment::SendPacket (Ptr<Socket> socket, uint32_t pktSize,
-                             uint32_t pktCount, Time pktInterval )
-{
-  if (pktCount > 0)
-    {
-      socket->Send (Create<Packet> (pktSize));
-      Simulator::Schedule (pktInterval, &SendPacket,
-                           socket, pktSize,pktCount - 1, pktInterval);
-    }
-  else
-    {
-      socket->Close ();
-    }
-}
-
-Ptr<Socket>
-Experiment::SetupPacketSend (Ptr<Node> node)
-{
-  TypeId tid = TypeId::LookupByName ("ns3::PacketSocketFactory");
-  Ptr<Socket> source = Socket::CreateSocket (node, tid);
-  source->Bind ();
-  source->SetRecvCallback (MakeCallback (&Experiment::SendPacket, this));
-  return source;
 }
 
 Gnuplot2dDataset
 Experiment::Run (const WifiHelper &wifi, const YansWifiPhyHelper &wifiPhy,
                  const WifiMacHelper &wifiMac, const YansWifiChannelHelper &wifiChannel)
 {
-  std::string phyMode ("DsssRate1Mbps");
-  Config::SetDefault ("ns3::WifiRemoteStationManager::NonUnicastMode",
-                      StringValue (phyMode));
+  Config::SetDefault ("ns3::RandomWalk2dMobilityModel::Mode", StringValue ("Time"));
+  Config::SetDefault ("ns3::RandomWalk2dMobilityModel::Time", StringValue ("2s"));
+  Config::SetDefault ("ns3::RandomWalk2dMobilityModel::Speed", StringValue ("ns3::ConstantRandomVariable[Constant=1.0]"));
+  Config::SetDefault ("ns3::RandomWalk2dMobilityModel::Bounds", StringValue ("0|200|0|200"));
+
   m_bytesTotal = 0;
 
   NodeContainer c;
   c.Create (20);
-
-  PacketSocketHelper packetSocket;
-  packetSocket.Install (c);
 
   YansWifiPhyHelper phy = wifiPhy;
   phy.SetChannel (wifiChannel.Create ());
@@ -175,49 +147,62 @@ Experiment::Run (const WifiHelper &wifi, const YansWifiPhyHelper &wifiPhy,
 
   MobilityHelper mobility;
   mobility.SetPositionAllocator ("ns3::RandomDiscPositionAllocator",
-                                 "X", StringValue ("100.0"),
-                                 "Y", StringValue ("100.0"),
-                                 "Rho", StringValue ("ns3::UniformRandomVariable[Min=0|Max=30]"));
-  mobility.SetMobilityModel ("ns3::ConstantPositionMobilityModel");
+                                  "X", StringValue ("100.0"),
+                                  "Y", StringValue ("100.0"),
+                                  "Rho", StringValue ("ns3::UniformRandomVariable[Min=0|Max=30]"));
+  mobility.SetMobilityModel ("ns3::RandomWalk2dMobilityModel",
+                              "Mode", StringValue ("Time"),
+                              "Time", StringValue ("2s"),
+                              "Speed", StringValue ("ns3::ConstantRandomVariable[Constant=2.0]"),
+                              "Bounds", StringValue ("0|200|0|200"));
 
   mobility.Install (c);
+  Config::Connect ("/NodeList/*/$ns3::MobilityModel/CourseChange",
+                    MakeCallback (&CourseChange));
 
-  // Enable OLSR
 
-  OlsrHelper olsr;
-  Ipv4StaticRoutingHelper staticRouting;
+  RipNgHelper ripNg;
+  Ipv6StaticRoutingHelper staticRouting;
 
-  Ipv4ListRoutingHelper list;
+  Ipv6ListRoutingHelper list;
   list.Add (staticRouting, 0);
-  list.Add (olsr, 10);
+  list.Add (ripNg, 10);
 
   InternetStackHelper internet;
   internet.SetRoutingHelper (list); // has effect on the next Install ()
   internet.Install (c);
 
-  Ipv4AddressHelper ipv4;
+  Ipv6AddressHelper ipv6;
   NS_LOG_INFO ("Assign IP Addresses.");
-  ipv4.SetBase ("10.1.1.0", "255.255.255.0");
-  Ipv4InterfaceContainer i = ipv4.Assign (devices);
+  ipv6.SetBase (Ipv6Address ("2001:1::"), Ipv6Prefix (64));
+  Ipv6InterfaceContainer i = ipv6.Assign (devices);
 
-  PacketSocketAddress socket;
-  socket.SetSingleDevice (devices.Get (0)->GetIfIndex ());
-  socket.SetPhysicalAddress (devices.Get (1)->GetAddress ());
-  socket.SetProtocol (1);
+  Inet6SocketAddress socket = Inet6SocketAddress (i.GetAddress (0, 1));
 
   OnOffHelper onoff ("ns3::PacketSocketFactory", Address (socket));
   onoff.SetConstantRate (DataRate (60000000));
-  onoff.SetAttribute ("PacketSize", UintegerValue (2000));
+  onoff.SetAttribute ("PacketSize", UintegerValue (4096));
+
+  Ptr<FlowMonitor> flowMonitor;
+  FlowMonitorHelper flowHelper;
+  flowMonitor = flowHelper.InstallAll();
 
   ApplicationContainer apps = onoff.Install (c.Get (0));
   apps.Start (Seconds (0.5));
-  apps.Stop (Seconds (120.0));
-
-  Simulator::Schedule (Seconds (1.5), &Experiment::AdvancePosition, this, c.Get (1));
+  apps.Stop (Seconds (300.0));
+  
+  NS_LOG_UNCOND ("socket receive");
+  
   Ptr<Socket> recvSink = SetupPacketReceive (c.Get (1));
   AnimationInterface anim ("animation.xml");
+  anim.EnablePacketMetadata (true);
+  phy.EnablePcap ("crowdsrc-adhoc", devices);
+  NS_LOG_UNCOND ("run");
+  Simulator::Stop (Seconds (600.0));
   Simulator::Run ();
 
+  NS_LOG_UNCOND ("destroy");
+  flowMonitor->SerializeToXmlFile ("crowdsrc-adhoc-flow.xml", true, true);
   Simulator::Destroy ();
 
   return m_output;
@@ -230,6 +215,15 @@ int main (int argc, char *argv[])
 
   Gnuplot gnuplot = Gnuplot ("reference-rates.png");
 
+  /* 
+  * In this section I had hoped to add more complex features
+  * of WiFi transmission such as noise, delay, loss, etc. These
+  * were ultimately left out as the simulation would run but packets
+  * would not be sent. I had not worked out the cause as I did not
+  * deem it of high priority but I think it would have helped the quality
+  * of the project if added in.
+   */
+
   Experiment experiment;
   WifiHelper wifi;
   wifi.SetStandard (WIFI_PHY_STANDARD_80211a);
@@ -239,27 +233,34 @@ int main (int argc, char *argv[])
   wifiPhy.Set ("RxGain", DoubleValue (-10) );
   wifiPhy.SetPcapDataLinkType (WifiPhyHelper::DLT_IEEE802_11_RADIO);
   YansWifiChannelHelper wifiChannel = YansWifiChannelHelper::Default ();
-  wifiChannel.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
-  wifiChannel.AddPropagationLoss ("ns3::FriisPropagationLossModel");
+  //wifiChannel.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
+  //wifiChannel.AddPropagationLoss ("ns3::FriisPropagationLossModel");
   wifiPhy.SetChannel (wifiChannel.Create ());
+  //double txp = 7.5;
+  //wifiPhy.Set ("TxPowerStart",DoubleValue (txp));
+  //wifiPhy.Set ("TxPowerEnd", DoubleValue (txp));
   Gnuplot2dDataset dataset;
 
   wifiMac.SetType ("ns3::AdhocWifiMac");
 
-  // Add an upper mac and disable rate control
-  wifi.SetStandard (WIFI_PHY_STANDARD_80211b);
-  wifi.SetRemoteStationManager ("ns3::ConstantRateWifiManager",
-                                "DataMode",StringValue ("DsssRate1Mbps"),
-                                "ControlMode",StringValue ("DsssRate1Mbps"));
+  /* 
+  * The following code was taken from the wifi-adhoc.cc script, and
+  * was used for debugging as I would test the script against these
+  * different settings. In the final version, I thought they were superfluous
+  * as only one setting would produce an animation and trace files for analysis,
+  * so I opted for one, which was the Ideal setting. I have left these in for
+  * context with my testing.
+   */
 
-  NS_LOG_DEBUG ("54");
+
+  /*NS_LOG_DEBUG ("54");
   experiment = Experiment ("54mb");
   wifi.SetRemoteStationManager ("ns3::ConstantRateWifiManager",
-                                "DataMode", StringValue ("OfdmRate54Mbps"));
+                                "DataMode", StringValue ("OfdmRate54Mbps"));                  
   dataset = experiment.Run (wifi, wifiPhy, wifiMac, wifiChannel);
   gnuplot.AddDataset (dataset);
 
-  /*NS_LOG_DEBUG ("48");
+  NS_LOG_DEBUG ("48");
   experiment = Experiment ("48mb");
   wifi.SetRemoteStationManager ("ns3::ConstantRateWifiManager",
                                 "DataMode", StringValue ("OfdmRate48Mbps"));
@@ -306,14 +307,14 @@ int main (int argc, char *argv[])
   wifi.SetRemoteStationManager ("ns3::ConstantRateWifiManager",
                                 "DataMode", StringValue ("OfdmRate6Mbps"));
   dataset = experiment.Run (wifi, wifiPhy, wifiMac, wifiChannel);
-  gnuplot.AddDataset (dataset);*/
+  gnuplot.AddDataset (dataset);
 
   gnuplot.GenerateOutput (std::cout);
 
   gnuplot = Gnuplot ("rate-control.png");
   wifi.SetStandard (WIFI_PHY_STANDARD_holland);
 
-  /*NS_LOG_DEBUG ("arf");
+  NS_LOG_DEBUG ("arf");
   experiment = Experiment ("arf");
   wifi.SetRemoteStationManager ("ns3::ArfWifiManager");
   dataset = experiment.Run (wifi, wifiPhy, wifiMac, wifiChannel);
@@ -341,7 +342,7 @@ int main (int argc, char *argv[])
   experiment = Experiment ("rraa");
   wifi.SetRemoteStationManager ("ns3::RraaWifiManager");
   dataset = experiment.Run (wifi, wifiPhy, wifiMac, wifiChannel);
-  gnuplot.AddDataset (dataset);
+  gnuplot.AddDataset (dataset);*/
 
   NS_LOG_DEBUG ("ideal");
   experiment = Experiment ("ideal");
@@ -349,7 +350,7 @@ int main (int argc, char *argv[])
   dataset = experiment.Run (wifi, wifiPhy, wifiMac, wifiChannel);
   gnuplot.AddDataset (dataset);
 
-  gnuplot.GenerateOutput (std::cout);*/
+  gnuplot.GenerateOutput (std::cout);
 
   return 0;
 }
